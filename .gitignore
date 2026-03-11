@@ -1,0 +1,14 @@
+node_modules/
+dist/
+
+# Token files - NEVER commit
+*.token
+*.token.txt
+token.txt
+.secrets/
+*-token.txt
+*_token.txt
+
+# Environment files
+.env
+.env.*
