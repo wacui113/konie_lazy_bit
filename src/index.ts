@@ -1,12 +1,19 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { api } from "./client.ts";
+import { getBitbucketBackend } from "./backends/index.ts";
+import type {
+  PagedResponse,
+  PullRequest,
+  Activity,
+  Comment,
+  DiffResponse,
+} from "./types.ts";
 
 // ─── Shared param shapes ─────────────────────────────────────────────────────
 
 const repoShape = {
-  project: z.string().describe("Bitbucket project key (e.g. PROJ)"),
+  project: z.string().describe("Bitbucket project key (e.g. PROJ) or workspace (Cloud)"),
   repo: z.string().describe("Repository slug (e.g. my-repo)"),
 };
 
@@ -14,65 +21,6 @@ const prShape = {
   ...repoShape,
   prId: z.number().int().positive().describe("Pull request ID"),
 };
-
-// ─── Bitbucket API types ─────────────────────────────────────────────────────
-
-interface PagedResponse<T> {
-  values: T[];
-  size: number;
-  isLastPage: boolean;
-  start: number;
-  limit: number;
-  nextPageStart?: number;
-}
-
-interface PullRequest {
-  id: number;
-  title: string;
-  description?: string;
-  state: string;
-  version: number;
-  author: { user: { displayName: string; name: string } };
-  reviewers: Array<{
-    user: { displayName: string; name: string };
-    status: string;
-  }>;
-  fromRef: { displayId: string };
-  toRef: { displayId: string };
-  createdDate: number;
-  updatedDate: number;
-  links?: { self?: Array<{ href: string }> };
-}
-
-interface Activity {
-  id: number;
-  action: string;
-  createdDate: number;
-  user: { displayName: string; name: string };
-  comment?: { id: number; text: string };
-  commentAnchor?: { path: string; line: number };
-}
-
-interface Comment {
-  id: number;
-  text: string;
-  author?: { displayName: string; name: string };
-}
-
-interface DiffResponse {
-  diffs: Array<{
-    source?: { toString: string };
-    destination?: { toString: string };
-    hunks: Array<{
-      sourceLine: number;
-      destinationLine: number;
-      segments: Array<{
-        type: string;
-        lines: Array<{ line: string; source: number; destination: number }>;
-      }>;
-    }>;
-  }>;
-}
 
 // ─── Formatters ──────────────────────────────────────────────────────────────
 
@@ -206,17 +154,13 @@ server.registerTool(
     },
   },
   async ({ project, repo, state, author, limit, start }) => {
-    const params = new URLSearchParams({
+    const backend = getBitbucketBackend();
+    const data = await backend.listPullRequests(project, repo, {
       state: state ?? "OPEN",
-      limit: String(limit ?? 25),
-      start: String(start ?? 0),
+      limit: limit ?? 25,
+      start: start ?? 0,
+      author: author ?? undefined,
     });
-    if (author) params.set("author.username", author);
-
-    const data = await api.get<PagedResponse<PullRequest>>(
-      `/projects/${project}/repos/${repo}/pull-requests?${params}`
-    );
-
     return { content: [{ type: "text", text: formatPrList(data) }] };
   }
 );
@@ -229,9 +173,7 @@ server.registerTool(
     inputSchema: prShape,
   },
   async ({ project, repo, prId }) => {
-    const pr = await api.get<PullRequest>(
-      `/projects/${project}/repos/${repo}/pull-requests/${prId}`
-    );
+    const pr = await getBitbucketBackend().getPullRequest(project, repo, prId);
     return { content: [{ type: "text", text: formatPrDetail(pr) }] };
   }
 );
@@ -255,11 +197,11 @@ server.registerTool(
     },
   },
   async ({ project, repo, prId, contextLines }) => {
-    const params = new URLSearchParams({
-      contextLines: String(contextLines ?? 3),
-    });
-    const data = await api.get<DiffResponse>(
-      `/projects/${project}/repos/${repo}/pull-requests/${prId}/diff?${params}`
+    const data = await getBitbucketBackend().getPullRequestDiff(
+      project,
+      repo,
+      prId,
+      contextLines ?? 3
     );
     return { content: [{ type: "text", text: formatDiff(data) }] };
   }
@@ -284,8 +226,11 @@ server.registerTool(
     },
   },
   async ({ project, repo, prId, limit }) => {
-    const data = await api.get<PagedResponse<Activity>>(
-      `/projects/${project}/repos/${repo}/pull-requests/${prId}/activities?limit=${limit ?? 50}`
+    const data = await getBitbucketBackend().getPullRequestActivities(
+      project,
+      repo,
+      prId,
+      limit ?? 50
     );
     return { content: [{ type: "text", text: formatActivities(data) }] };
   }
@@ -316,25 +261,13 @@ server.registerTool(
     },
   },
   async ({ project, repo, title, description, fromBranch, toBranch, reviewers }) => {
-    const body = {
+    const pr = await getBitbucketBackend().createPullRequest(project, repo, {
       title,
       description: description ?? "",
-      fromRef: {
-        id: `refs/heads/${fromBranch}`,
-        repository: { slug: repo, project: { key: project } },
-      },
-      toRef: {
-        id: `refs/heads/${toBranch ?? "main"}`,
-        repository: { slug: repo, project: { key: project } },
-      },
-      reviewers: (reviewers ?? []).map((slug) => ({ user: { name: slug } })),
-    };
-
-    const pr = await api.post<PullRequest>(
-      `/projects/${project}/repos/${repo}/pull-requests`,
-      body
-    );
-
+      fromBranch,
+      toBranch: toBranch ?? "main",
+      reviewers: reviewers ?? [],
+    });
     const text = `Created PR #${pr.id}: "${pr.title}"\nURL: ${pr.links?.self?.[0]?.href ?? "N/A"}`;
     return { content: [{ type: "text", text }] };
   }
@@ -366,22 +299,12 @@ server.registerTool(
     },
   },
   async ({ project, repo, prId, text, filePath, lineNumber, lineType }) => {
-    const body: Record<string, unknown> = { text };
-
-    if (filePath && lineNumber !== undefined) {
-      body.anchor = {
-        line: lineNumber,
-        lineType: lineType ?? "ADDED",
-        path: filePath,
-        fileType: "TO",
-      };
-    }
-
-    const comment = await api.post<Comment>(
-      `/projects/${project}/repos/${repo}/pull-requests/${prId}/comments`,
-      body
-    );
-
+    const comment = await getBitbucketBackend().addPrComment(project, repo, prId, {
+      text,
+      filePath,
+      lineNumber,
+      lineType: lineType ?? "ADDED",
+    });
     const result = `Comment #${comment.id} added by ${comment.author?.displayName ?? "unknown"}.`;
     return { content: [{ type: "text", text: result }] };
   }
@@ -403,10 +326,7 @@ server.registerTool(
     },
   },
   async ({ project, repo, prId, userSlug }) => {
-    await api.put(
-      `/projects/${project}/repos/${repo}/pull-requests/${prId}/participants/${userSlug}`,
-      { status: "APPROVED" }
-    );
+    await getBitbucketBackend().approvePullRequest(project, repo, prId, userSlug);
     return {
       content: [{ type: "text", text: `PR #${prId} approved by ${userSlug}.` }],
     };
@@ -425,10 +345,7 @@ server.registerTool(
     },
   },
   async ({ project, repo, prId, userSlug }) => {
-    await api.put(
-      `/projects/${project}/repos/${repo}/pull-requests/${prId}/participants/${userSlug}`,
-      { status: "UNAPPROVED" }
-    );
+    await getBitbucketBackend().unapprovePullRequest(project, repo, prId, userSlug);
     return {
       content: [
         {
